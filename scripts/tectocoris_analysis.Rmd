@@ -1,0 +1,956 @@
+---
+title: "Tectocoris analysis"
+author: "Kei-Lin Ooi"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+In this study, we examined the role of reflectivity in thermoregulation and its influence on warning signal variation in the cotton harlequin bug. Here, we have provided the code used to inspect and extract the results of the reflectivity measurements and heating experiments, as well as the code used to analyse the relationships between reflectivity, body size, and heating.
+
+# Setup
+
+Load our packages!
+
+```{r load packages, echo=TRUE, message=FALSE, warning=FALSE}
+library(pavo)
+library(tidyverse)
+library(corrplot)
+library(readxl)
+library(writexl)
+library(lattice)
+library(modelsummary)
+library(tinytable)
+library(ggimage)
+```
+
+```{r cleanup1, eval=FALSE, echo=FALSE, warning=FALSE}
+# remove ALL variables in the environment
+rm(list = ls())
+```
+
+```{r cleanup2, eval=FALSE, echo=FALSE, warning=FALSE}
+# clears the plotting console
+dev.off()
+```
+
+## Retrieve data
+
+Retrieve spectrophotometry, irradiance, and filter transmittance data.
+
+```{r, message=FALSE, warning=FALSE}
+### --- Spectrophotometry data from bugs --- ###
+specs <- read_excel("data/specs.xlsx", sheet = "bug_specs") %>%  as.rspec()
+# specs <- read.csv("Dryad/specs.csv") %>%  as.rspec()
+
+
+#### --- Irradiance data --- ####
+# Standard Solar Irradiance from 280 to 4000 nm
+  # ASTM G173-03 Reference Spectra Derived from SMARTS v. 2.9.2 (AM1.5)
+  # Global tilt  W*m-2*nm-1
+  # from https://www.pveducation.org/pvcdrom/appendices/standard-solar-spectra 
+sun <- read_excel("data/specs.xlsx", sheet = "irradiance") %>%
+  as.rspec(., whichwl = "wl") %>%  
+  filter(wl>=400 & wl<=1700) # Limit irradiance to the appropriate wavelength range for experiment
+
+
+#### --- Filter tranmittance data --- ####
+filters<-read_excel("data/specs.xlsx", sheet = "filter_transmittance") %>% 
+  as.rspec(.) %>% 
+  procspec(.,fixneg = "zero") %>% 
+  rename(Full.f = halfsun) %>%  # rename
+  mutate(vis.f = Full.f*visfilterTransmittance/100) %>% # vis filter
+  mutate(nir.f = Full.f*nirfilterTransmittance/100) %>% # nir filter
+  select(-visfilterTransmittance) %>% 
+  select(-nirfilterTransmittance)
+
+```
+
+Retrieve bug and heating data.
+
+```{r}
+# get reference datasheet
+datasheet <- read_excel("data/tectocoris_data.xlsx")
+
+# get vector of individual bugs
+bugs <- dir(path = "data/heating_data", pattern = "CSV") %>% gsub(pattern="\\w+\\_(\\w+).CSV", replacement="\\1") %>% unique()
+# get treatments
+treatments <- c("full", "nir", "uvvis")
+
+```
+
+# Reflectivity analysis
+
+We measured the total hemispherical reflectance for a subset of individuals (n=11) in order to calculate the reflectivity of each bug. Looking at the effect of reflectivity on heating instead of colour allows us to investigate the effect of full spectrum solar light.
+
+## Compiling spectrometer data
+
+When using two spectrometers, sometimes there is a jump/mismatch where they join, often because the specimen being measured is not flat and there light bleeding in through the probe. Here is code to correct.
+
+```{r, echo = TRUE, results="hide", message=FALSE, warning=FALSE}
+#### --- Correct jump in reflectance curve --- ####
+# new dataframe to save the fixed specs into
+specs2 <- data.frame(
+  wl = specs$wl)
+# loop to fix all specs
+for(i in 2:ncol(specs)){
+# calculate the difference between each reflectance measurement and the previous measurement
+lag1 <- specs[,i] - lag(specs[,i])
+# create a vector that identifies rows where the difference is greater than 1 or less than -1 (i.e. the jump)
+lagcondition <- lag1 > 1 | lag1 < -1
+# identifies the position in the dataset, so we can cut at a particular wavelengths
+positions <- which(lagcondition == TRUE)
+positions <- positions[positions >= 100] # set it to not fix jumps at the early wavelengths (<500)
+# *** THIS IS A CHECK! LOOK AT THIS OUTPUT *** it shows which wavelengths will be cut
+cutwls <- specs$wl[positions]
+print(colnames(specs)[i])
+print(cutwls)
+
+if (length(cutwls) == 0) {
+  specs2[,i] <- specs[,i]
+} else {
+# calculate difference - takes an average before and after the drop, in case there is noise 
+loweravg <- seq(min(positions)-5, min(positions)-1)
+upperavg <- seq(max(positions)+1, max(positions)+5)
+total <- mean(specs[loweravg, i]) - mean(specs[upperavg, i])
+
+# final adjustment - visible and UV wavelengths are not altered, but anything above the jump is altered
+  # the wavelengths where the jump occurred are removed
+specs2[,i] <-  case_when(
+  specs$wl < specs$wl[min(positions)] ~ specs[,i],
+  specs$wl > specs$wl[max(positions)] ~ specs[,i] + total,
+  specs$wl == specs$wl[positions]  ~ NA_integer_)
+}
+}
+
+# replace the column names
+colnames(specs2) <- colnames(specs)
+# turn back to rspec for easy plotting to check the final result
+specs2 <- as.rspec(specs2)
+
+
+#### --- Smooth curves --- ####
+# # this will produce graphs with 5 levels of smoothing. Pick the best, and input the value into 'span' below.
+# plotsmooth(specs2, minsmooth = 0.05, maxsmooth = 0.5, curves= 5, ask = FALSE) 
+
+specs3 <- procspec(specs2, opt='smooth', fixneg="addmin", span=0.05)
+
+
+#### --- Pivot data into format appropriate for ggplot --- ####
+specs_longer <- specs3 %>%
+  # Make dataset long
+  pivot_longer(2:length(specs), names_to = "specID", values_to = "Refl") %>% # change the number to how many files u have
+  # Create new columns for each variable based on spec name
+  mutate(code = str_split(specID, pattern = "_", simplify = TRUE)[,1],
+         region_colour = str_split(specID, pattern = "_", simplify = TRUE)[,3],
+         context = str_split(specID, pattern = "_", simplify = TRUE)[,2],
+         replicate = str_split(specID, pattern = "_", simplify = TRUE)[,6])
+
+# add colour column, considering sex
+specs_longer$code_replicate <- paste0(specs_longer$code, "_", specs_longer$replicate)
+specs_longer$sex <- gsub("[0-9]", "", specs_longer$code)
+specs_longer$sex_colour <- paste0(specs_longer$sex, "_", specs_longer$region_colour)
+specs_longer$sex <- factor(specs_longer$sex,
+                                   levels = c("male", "female"))
+
+```
+
+Visualise spectrometer readings.
+
+```{r}
+# plot spec curves
+plot(specs) # original
+plot(specs2) # fixed jump
+plot(specs3) # smoothed
+
+# plot reflectance reads by individual
+plotcolours <- c("black"="black", "blue"="blue", "green"="darkgreen", "orange" = "orange", "red" = "red")
+ggplot(specs_longer,
+       # %>%  filter(context == "dead"),
+       aes(x = wl, y = Refl)) +
+  geom_line(aes(color = region_colour), alpha = 0.3) +
+  facet_wrap(~ code, nrow = 3) +
+  # coord_cartesian(ylim = c(0, 110), xlim = c(900, 1000)) +
+  scale_colour_manual(values = plotcolours) +
+  theme_bw()
+
+
+```
+
+## Averaging reflectance
+
+Average all reads of a colour for each individual bug.
+
+```{r, message=FALSE, warning=FALSE}
+# define the function for calculating the standard error of the mean
+se <- function(x) {
+  sd(x) / sqrt(length(x))
+  }
+
+# average all reads of a colour for each individual bug
+specs_avg <- specs_longer %>% 
+  group_by(wl, code, sex_colour) %>% 
+  summarise(mean_refl = mean(Refl))
+
+```
+
+## Calculating reflectivity
+
+### 1. Data frame
+
+First, create a data frame with reflectance and irradiance, one per colour and for each treatment (full, NIR, and visible).
+
+We need the reflectivity for the iridescent portion, as well as for the non-iridescent portion for males and females. We average blue + green to represent iridescence, and red + orange to represent non-iridescence. Males and females non-iridescent patches are averaged separately because males are more red and females are more orange. Note that we ignore the black colour category since it is a rarer colour that some males exhibit in their iridescent patches.
+
+```{r}
+# get average across colour categories (blue and green averaged, red and orange averaged separately for males/females)
+
+full_iri <- specs_avg %>% 
+  filter(sex_colour=="male_blue" | sex_colour=="male_green" | sex_colour=="female_blue") %>% 
+  group_by(wl) %>% 
+  summarise(
+    mean_grouped_refl = mean(mean_refl), # calculate the mean reflectance
+    se_grouped_refl = se(mean_refl)) %>% # calculate standard error of the mean
+  data.frame(filters$Full.f) %>% # add the irradiance values
+  mutate(colour = "iridescent") # add a column indicating colour
+
+full_noniri_male <- specs_avg %>% 
+  filter(sex_colour=="male_red" | sex_colour=="male_orange") %>% 
+  group_by(wl) %>% 
+  summarise(
+    mean_grouped_refl = mean(mean_refl),
+    se_grouped_refl = se(mean_refl)) %>% 
+  data.frame(filters$Full.f) %>% 
+  mutate(colour = "male non-iridescent")
+
+full_noniri_female <- specs_avg %>% 
+  filter(sex_colour=="female_orange") %>% 
+  group_by(wl) %>% 
+  summarise(
+    mean_grouped_refl = mean(mean_refl),
+    se_grouped_refl = se(mean_refl)) %>% 
+  data.frame(filters$Full.f) %>% 
+  mutate(colour = "female non-iridescent")
+
+# for nir
+nir_iri <- specs_avg %>% 
+  filter(sex_colour=="male_blue" | sex_colour=="male_green" | sex_colour=="female_blue") %>% 
+  group_by(wl) %>% 
+  summarise(
+    mean_grouped_refl = mean(mean_refl), # calculate the mean reflectance
+    se_grouped_refl = se(mean_refl)) %>% # calculate standard error of the mean
+  data.frame(filters$nir.f) %>% # add the irradiance values
+  mutate(colour = "iridescent") # add a column indicating colour
+
+nir_noniri_male <- specs_avg %>% 
+  filter(sex_colour=="male_red" | sex_colour=="male_orange") %>% 
+  group_by(wl) %>% 
+  summarise(
+    mean_grouped_refl = mean(mean_refl),
+    se_grouped_refl = se(mean_refl)) %>% 
+  data.frame(filters$nir.f) %>% 
+  mutate(colour = "male non-iridescent")
+
+nir_noniri_female <- specs_avg %>% 
+  filter(sex_colour=="female_orange") %>% 
+  group_by(wl) %>% 
+  summarise(
+    mean_grouped_refl = mean(mean_refl),
+    se_grouped_refl = se(mean_refl)) %>% 
+  data.frame(filters$nir.f) %>% 
+  mutate(colour = "female non-iridescent")
+
+# for visible
+vis_iri <- specs_avg %>% 
+  filter(sex_colour=="male_blue" | sex_colour=="male_green" | sex_colour=="female_blue") %>% 
+  group_by(wl) %>% 
+  summarise(
+    mean_grouped_refl = mean(mean_refl), # calculate the mean reflectance
+    se_grouped_refl = se(mean_refl)) %>% # calculate standard error of the mean
+  data.frame(filters$vis.f) %>% # add the irradiance values
+  mutate(colour = "iridescent") # add a column indicating colour
+
+vis_noniri_male <- specs_avg %>% 
+  filter(sex_colour=="male_red" | sex_colour=="male_orange") %>% 
+  group_by(wl) %>% 
+  summarise(
+    mean_grouped_refl = mean(mean_refl),
+    se_grouped_refl = se(mean_refl)) %>% 
+  data.frame(filters$vis.f) %>% 
+  mutate(colour = "male non-iridescent")
+
+vis_noniri_female <- specs_avg %>% 
+  filter(sex_colour=="female_orange") %>% 
+  group_by(wl) %>% 
+  summarise(
+    mean_grouped_refl = mean(mean_refl),
+    se_grouped_refl = se(mean_refl)) %>% 
+  data.frame(filters$vis.f) %>% 
+  mutate(colour = "female non-iridescent")
+
+```
+
+Plot mean and SE for iridescent and non-iridescent patches.
+
+```{r}
+full_group <- rbind(full_iri, full_noniri_male, full_noniri_female)
+
+# Plot mean and SE for iridescent and non-iridescent patches
+full_group$colour <- factor(full_group$colour,
+                                   levels = c("female non-iridescent","male non-iridescent", "iridescent"))
+
+# plot the means and the standard error of the mean
+ggplot(full_group, aes(x = wl, y = mean_grouped_refl, colour = colour)) +
+  geom_line(alpha = 0.7, linewidth = 1) +  # Line with colour mapped globally
+  geom_ribbon(aes(ymin = mean_grouped_refl - se_grouped_refl, # add the standard error of the mean
+                  ymax = mean_grouped_refl + se_grouped_refl, fill = colour),
+              alpha = .2, colour = NA) +  # Fill for ribbon, no border line
+  geom_vline(xintercept = 700, linetype = 2, alpha = .5) + # add the border for visual spectra
+    annotate("text", x = 700, y = Inf, label = "near infrared →",
+             vjust=1.35, hjust=-0.1, alpha=0.5) +  # Label for NIR line
+  labs(x = "Wavelength", y = "Reflectance",
+       colour = "Colour", fill = "Colour") +  # Same label for both fill and colour
+  scale_colour_manual(values = c("iridescent" = "blue",
+                                 "female non-iridescent" = "orange",
+                                 "male non-iridescent" = "red")) +
+  scale_fill_manual(values = c("iridescent" = "blue",
+                               "female non-iridescent" = "orange",
+                               "male non-iridescent" = "red")) +
+  theme_bw()
+
+```
+
+### 2. Multiply
+
+Find the product between reflectivity and irradiance. Note: Here, reflectance is divided by 100, i.e. as a fraction that can vary between 0 and 1. We do this to be able to illustrate the results in a plot. However, it is not required to divide by 100. If we divide by 100, the answer will be the reflectivity as a proportion, and if we do not divide, the answer will be a percentage.
+
+```{r message=FALSE, warning=FALSE}
+# for full spectrum
+full_iri_R <- full_iri %>% 
+  mutate(product = mean_grouped_refl/100 * filters.Full.f) %>% #multiply
+  select(wl,product) %>% # Keep only the product and wl.
+  as.rspec()
+full_noniri_male_R <- full_noniri_male %>% 
+  mutate(product = mean_grouped_refl/100 * filters.Full.f) %>% #multiply
+  select(wl,product) %>% # Keep only the product and wl.
+  as.rspec()
+full_noniri_female_R <- full_noniri_female %>% 
+  mutate(product = mean_grouped_refl/100 * filters.Full.f) %>% #multiply
+  select(wl,product) %>% # Keep only the product and wl.
+  as.rspec()
+
+# for nir
+nir_iri_R <- nir_iri %>% 
+  mutate(product = mean_grouped_refl/100 * filters.nir.f) %>% #multiply
+  select(wl,product) %>% # Keep only the product and wl.
+  as.rspec()
+nir_noniri_male_R <- nir_noniri_male %>% 
+  mutate(product = mean_grouped_refl/100 * filters.nir.f) %>% #multiply
+  select(wl,product) %>% # Keep only the product and wl.
+  as.rspec()
+nir_noniri_female_R <- nir_noniri_female %>% 
+  mutate(product = mean_grouped_refl/100 * filters.nir.f) %>% #multiply
+  select(wl,product) %>% # Keep only the product and wl.
+  as.rspec()
+
+# for visible (no UV)
+vis_iri_R <- vis_iri %>% 
+  mutate(product = mean_grouped_refl/100 * filters.vis.f) %>% #multiply
+  select(wl,product) %>% # Keep only the product and wl.
+  as.rspec()
+vis_noniri_male_R <- vis_noniri_male %>% 
+  mutate(product = mean_grouped_refl/100 * filters.vis.f) %>% #multiply
+  select(wl,product) %>% # Keep only the product and wl.
+  as.rspec()
+vis_noniri_female_R <- vis_noniri_female %>% 
+  mutate(product = mean_grouped_refl/100 * filters.vis.f) %>% #multiply
+  select(wl,product) %>% # Keep only the product and wl.
+  as.rspec()
+
+```
+
+### 3. Find the integral and standardize
+
+Find the area under the curve for the product that we just calculated and the area under the curve for the raw irradiance of the illumination source. Divide the area under curve for sample by the area under curve for irradiance to get the proportion of light that each patch is able to reflect.
+
+```{r message=FALSE, warning=FALSE}
+# calculate the reflectivity for each colour in the full spectrum
+reflectivity_full_iri <- summary(full_iri_R)$B1/summary(filters[,c(1,2)])$B1
+reflectivity_full_noniri_male <- summary(full_noniri_male_R)$B1/summary(filters[,c(1,2)])$B1
+reflectivity_full_noniri_female <- summary(full_noniri_female_R)$B1/summary(filters[,c(1,2)])$B1
+
+reflectivity_full <- c("iridescent" = reflectivity_full_iri, "non_iridescent_male" = reflectivity_full_noniri_male, "non_iridescent_female" = reflectivity_full_noniri_female)
+
+# calculate the reflectivity for each colour in the nir spectrum
+reflectivity_nir_iri <- summary(nir_iri_R)$B1/summary(filters[,c(1,4)])$B1
+reflectivity_nir_noniri_male <- summary(nir_noniri_male_R)$B1/summary(filters[,c(1,4)])$B1
+reflectivity_nir_noniri_female <- summary(nir_noniri_female_R)$B1/summary(filters[,c(1,4)])$B1
+
+reflectivity_nir <- c("iridescent" = reflectivity_nir_iri, "non_iridescent_male" = reflectivity_nir_noniri_male, "non_iridescent_female" = reflectivity_nir_noniri_female)
+
+# calculate the reflectivity for each colour in the visible spectrum
+reflectivity_vis_iri <- summary(vis_iri_R)$B1/summary(filters[,c(1,3)])$B1
+reflectivity_vis_noniri_male <- summary(vis_noniri_male_R)$B1/summary(filters[,c(1,3)])$B1
+reflectivity_vis_noniri_female <- summary(vis_noniri_female_R)$B1/summary(filters[,c(1,3)])$B1
+
+reflectivity_vis <- c("iridescent" = reflectivity_vis_iri, "non_iridescent_male" = reflectivity_vis_noniri_male, "non_iridescent_female" = reflectivity_vis_noniri_female)
+
+# compile all reflectivirty measures, convert to data frame and save
+reflectivity <- data.frame(colour = names(reflectivity_full), full = reflectivity_full, nir = reflectivity_nir, vis = reflectivity_vis)
+
+```
+
+### 4. Visualise
+
+Since reflectivity is a constant, we can plot it in a bar graph.
+
+```{r, message=FALSE}
+reflectivity_longer <- reflectivity %>% pivot_longer(cols = -colour, names_to = "treatment", values_to = "reflectivity") %>% arrange(treatment)
+reflectivity_longer[reflectivity_longer == "non_iridescent_female"] <- "female non-iridescent"
+reflectivity_longer[reflectivity_longer == "non_iridescent_male"] <- "male non-iridescent"
+reflectivity_longer[reflectivity_longer == "full"] <- "Full"
+reflectivity_longer[reflectivity_longer == "nir"] <- "Near-infrared"
+reflectivity_longer[reflectivity_longer == "vis"] <- "Visible"
+reflectivity_longer$reflectivity <- reflectivity_longer$reflectivity*100
+# Reorder the factor levels of region_colour
+reflectivity_longer$colour <- factor(reflectivity_longer$colour,
+                                   levels = c("female non-iridescent","male non-iridescent", "iridescent"))
+
+ggplot(data=reflectivity_longer, aes(x=treatment, y=reflectivity, fill = colour)) +
+  geom_bar(position = "dodge", stat = "identity", alpha = .75) +
+  geom_text(aes(label = round(reflectivity, 2)),  # Add labels, including rounding decimal points (round)
+            position = position_dodge(width = 0.9),  # Adjust position to match the bars
+            vjust = -0.5,  # Adjust vertical position (move labels above bars)
+            size = 3) +  # Adjust the text size
+  coord_cartesian(ylim = c(0, 100)) +
+  labs(x = "Treatment", y = "Reflectivity (%)", fill = "Colour") +
+  scale_fill_manual(values = c("iridescent"="blue", "female non-iridescent"="orange", "male non-iridescent"="red")) +
+  # ylim(0,1)+
+  theme_bw()
+
+```
+
+## Weigh reflectivity
+
+Calculate the total reflectivity values for each bug.
+
+```{r}
+# create empty columns for reflectivity values in bug datasheet
+datasheet$reflectivity_full_iri <- NA
+datasheet$reflectivity_full_noniri <- NA
+datasheet$reflectivity_nir_iri <- NA
+datasheet$reflectivity_nir_noniri <- NA
+datasheet$reflectivity_vis_iri <- NA
+datasheet$reflectivity_vis_noniri <- NA
+# add colour category reflectivity values to bug datasheet
+for(i in 1:nrow(datasheet)) {
+  if (datasheet[i, "sex"] == "male") {
+    # full
+    datasheet[i, "reflectivity_full_iri"] <- reflectivity[1, "full"]
+    datasheet[i, "reflectivity_full_noniri"] <- reflectivity[2, "full"]
+    # nir
+    datasheet[i, "reflectivity_nir_iri"] <- reflectivity[1, "nir"]
+    datasheet[i, "reflectivity_nir_noniri"] <- reflectivity[2, "nir"]
+    # visible
+    datasheet[i, "reflectivity_vis_iri"] <- reflectivity[1, "vis"]
+    datasheet[i, "reflectivity_vis_noniri"] <- reflectivity[2, "vis"]
+  } else {
+    # full
+    datasheet[i, "reflectivity_full_iri"] <- reflectivity[1, "full"]
+    datasheet[i, "reflectivity_full_noniri"] <- reflectivity[3, "full"]
+    # nir
+    datasheet[i, "reflectivity_nir_iri"] <- reflectivity[1, "nir"]
+    datasheet[i, "reflectivity_nir_noniri"] <- reflectivity[3, "nir"]
+    # visible
+    datasheet[i, "reflectivity_vis_iri"] <- reflectivity[1, "vis"]
+    datasheet[i, "reflectivity_vis_noniri"] <- reflectivity[3, "vis"]
+  }
+}
+
+# calculate bug reflectivity values (weighted by proportion of each colour patch - values independent of body size)
+datasheet <- datasheet %>% 
+  mutate(
+    full_wrfl = (proportion_iridescent*reflectivity_full_iri)+(proportion_noniridescent*reflectivity_full_noniri),
+    nir_wrfl = (proportion_iridescent*reflectivity_nir_iri)+(proportion_noniridescent*reflectivity_nir_noniri),
+    vis_wrfl = (proportion_iridescent*reflectivity_vis_iri)+(proportion_noniridescent*reflectivity_vis_noniri)
+  )
+
+# calculate bug reflectivity values (weighted by area of each colour patch - values dependent on body size)
+datasheet <- datasheet %>% 
+  mutate(
+    full_wrfl_area = (area_iridescent_mm2*reflectivity_full_iri)+(area_noniridescent_mm2*reflectivity_full_noniri),
+    nir_wrfl_area = (area_iridescent_mm2*reflectivity_nir_iri)+(area_noniridescent_mm2*reflectivity_nir_noniri),
+    vis_wrfl_area = (area_iridescent_mm2*reflectivity_vis_iri)+(area_noniridescent_mm2*reflectivity_vis_noniri)
+  )
+
+```
+
+# Heating analysis
+
+We conducted heating experiments using a solar simulator which approximates the spectral power distribution of natural sunlight. To understand the effect on heating, we measure two different aspects of heating:
+
+\- **ΔT**: the change/difference in temperature from the last point from the starting point, in which the final time point is after 5 minutes
+
+\- **βT**: the maximum slope of the heating curve (in degrees C per second), which is representative of the heating rate. Note that we took temperature measurements every 10 seconds, and averaged the slope over 20 seconds (2 cycles). Averaging over a longer time interval smooths out the curve to account for anomalies in heating.
+
+## Calculate heating statistics
+
+Create a function to extract our heating summary statistics.
+```{r}
+# function to get heating rates summary stats
+ht<-function(heating,time_interval=10){ # inputs are temp of the bug at each point and the sampling time
+              delta<-heating[length(heating)]-heating[1] # this gives the total delta/change in bug temp
+              tmp_slope<-c() # create empty vector to store temp slope (change per time)
+              count=1
+              while(count<length(heating)){ # for all intervals
+                    tmp<-(heating[count+2]-heating[count])/(time_interval*2) # get the change in temp, in degrees C per second, change count+time interval accordingly
+                    tmp_slope<-c(tmp_slope,tmp) # save the output
+                    count=count+1
+                    }
+              slope=max(na.omit(tmp_slope)) # get the max slope (temp increase) -> note that this won't look at negative slopes
+              return(c(delta,slope)) # return max slope and total delta
+}
+
+```
+
+Run the function every bug we have data for.
+```{r, message=FALSE}
+# create new dataframe
+reference <- datasheet
+heating_data_path <- "data/heating_data/"
+
+# add image paths for plotting
+reference$imgpath <- paste0("data/bug_pics/", reference$code, ".png")
+
+# get individual bugs
+bugs <- dir(path = heating_data_path, pattern = "CSV") %>% gsub(pattern="\\w+\\_(\\w+).CSV", replacement="\\1") %>% unique()
+# get treatments
+treatments <- c("full", "nir", "uvvis")
+
+# create empty columns to add delta and slope to each treatment
+columnsAdd<-as.vector(outer(treatments, c("_delta","_slope"), paste0))
+# add the columns to reference (the datasheet)
+reference[,columnsAdd]<-0
+
+# for loop to extract the heating summary stats
+for(g in bugs){
+for(t in treatments){
+	tmp<-read_csv(paste0(heating_data_path, t,"_",g,".CSV"),col_names=FALSE) # read in the thermodata
+	tmp<-tmp[1:30,] # make sure that all data is from cycle 1-30 only (or whatever cycle number)
+	tmp<-tmp[,3:4] # this is the bug temp and air temp
+	colnames(tmp)<-c("temp_bug", "temp_air")
+	tmp$temp_standardized <- tmp$temp_bug-tmp$temp_air # this just creates an extra column if you want to standardize the bug temp by air temp
+	measures<-ht(heating=tmp$temp_bug,time_interval=10) # this will give delta and slope for bug
+	            # can control for air temp as needed, temp_bug is just bug, delta_temp_air is bug-air
+	pos<-grep(paste0("\\b",g,"\\b"),reference$code)
+	reference[pos,paste0(t,c("_delta","_slope"))]<-data.frame(measures[1],measures[2])
+}
+}
+
+```
+
+## Plot solar simulation trials
+
+The following code was used to troubleshoot outliers and check the effect of air temperature on the solar simulator results. Here we calculate **delta_temp**, which standardizes the bug temperature using the starting air temperature, and **delta_temp_air**, which standardizes the bug temperature using the air temperature recorded simultaneously. 
+
+```{r, message=FALSE}
+# empty tibble
+solarsim_runs<-tibble(bug=character(),temp_bug=numeric(),temp_air=numeric(),delta_temp=numeric(),time=numeric(),trial=character(),treatment=character()) 
+# bugs is list of individuals
+for(f in bugs){
+  files=dir(path = heating_data_path, pattern=paste0("_",f,".CSV")) #list of file per individual ID
+  for(all in files){
+    tmp<-read_csv(paste0(heating_data_path, all),col_names=FALSE)
+    tmp<-tmp[1:60,]
+    tmp<-tmp[,c(3,4)]
+    colnames(tmp)<-c("temp_bug","temp_air")
+    tmp$delta_temp<-tmp$temp_bug-tmp$temp_bug[1] # standardizing using bug starting temp
+    tmp$delta_temp_air<-tmp$temp_bug-tmp$temp_air # standardizing using simultaneous air temp
+    tmp$time<-seq(0,590,10)
+    # tmp$trial<-rep(x=gsub(pattern="(\\w+)\\_\\w+\\_\\w+.CSV",replacement="\\1",x=all),times=nrow(tmp)) # get the repetition ID
+    tmp$treatment<-rep(x=gsub(pattern="^(\\w+)\\_(\\w+)\\.CSV",replacement="\\1",x=all),times=nrow(tmp))
+    tmp$bug<-f# bug ID
+    tmp$sex <- rep(x=gsub(pattern="^[0-9]+",replacement="",x=f),times=nrow(tmp))
+    solarsim_runs<-rbind(solarsim_runs,tmp)
+  }
+}
+
+```
+
+We can plot the full, NIR, and UV-visible runs from the solar simulator for each bug.
+```{r}
+# plot the individual solar sim runs (controlled using starting air temperature)
+ggplot(solarsim_runs, 
+       aes(y=delta_temp, x=time, colour=treatment)) +
+  geom_line(aes()) + 
+  # geom_line(aes(colour="black",y=temp_air-temp_air[1])) + 
+  facet_wrap(~ bug, nrow = 5) +
+  # coord_cartesian(ylim = c(18, 23), xlim = c(0, 300)) +
+  coord_cartesian(ylim = c(-1, 20), xlim = c(0, 300)) +
+  # coord_cartesian(ylim = c(18, 40), xlim = c(0, 300)) +
+  theme_bw()
+
+# plot the temperature of the bugs run with full spectrum light
+solarsim_runs %>% 
+  filter(
+    # sex == "male" | sex == "female",
+         treatment == "full") %>% 
+  ggplot(aes(y = temp_bug, x = time, group  = factor(bug), color = bug)) + 
+  geom_line(alpha = 0.5, linewidth = 1) +
+  theme_bw()
+
+```
+
+# Statistical analysis
+
+## Size-dependent reflectivity and heating
+
+To check that our setup could detect variation in heating rates, we used a linear regression to examine the relationship between heating and area-dependent reflectivity, which accounts for the reflectivity of absolute surface area of the bug. We calculated area-dependent reflectivity as the reflectivity of the colour patches multiplied by their area – as opposed to the proportion – which means this is a measure of reflectivity that incorporates body size.
+
+#### Model summaries
+
+Results of the linear models.
+
+```{r}
+models_sizerefl <- list(
+  "full" = lm(data = reference, full_delta ~ full_wrfl_area),
+  "NIR" = lm(data = reference, nir_delta ~ nir_wrfl_area),
+  "UV-VIS" = lm(data = reference, uvvis_delta ~ vis_wrfl_area),
+  "full" = lm(data = reference, full_slope ~ full_wrfl_area),
+  "NIR" = lm(data = reference, nir_slope ~  nir_wrfl_area),
+  "UV-VIS" = lm(data = reference, uvvis_slope ~vis_wrfl_area)
+)
+  
+modelsummary(models_sizerefl, stars = TRUE,
+             estimate = "{estimate}",
+             statistic = c("{std.error}",
+                           "{statistic}",
+                           "{p.value}"),
+             output = "tinytable") %>% 
+  group_tt(j = list("Delta (ΔT)" = 2:4, "Slope (βT)" = 5:7)) #%>%  save_tt("models_sizerefl.docx")
+
+```
+
+### Visualise
+
+#### Models with ΔT (final temperature after 5 minutes) as response variable.
+
+```{r}
+# treatment = full
+ggplot(data = reference, aes(y=full_delta, x=full_wrfl_area)) +
+  geom_smooth(method = lm) +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "ΔT (°C)", x = "Reflectivity (%)",
+       colour = "Sex") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+# treatment = nir
+ggplot(data = reference, aes(y=nir_delta, x=nir_wrfl_area)) +
+  geom_smooth(method = lm) +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "ΔT (°C)", x = "Reflectivity (%)",
+       colour = "Sex") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+# treatment = uvvis
+ggplot(data = reference, aes(y=uvvis_delta, x=vis_wrfl_area)) +
+  geom_smooth(method = lm) +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "ΔT (°C)", x = "Reflectivity (%)",
+       colour = "Sex") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+```
+
+#### Models with βT (heating rate) as response variable.
+
+```{r}
+# models with slope as response
+
+# treatment = full
+ggplot(data = reference, aes(y=full_slope, x=full_wrfl_area)) +
+  geom_smooth(method = lm) +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "βT (Δ°C/second)", x = "Reflectivity (%)",
+       colour = "Sex") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+# treatment = nir
+ggplot(data = reference, aes(y=nir_slope, x=nir_wrfl_area)) +
+  geom_smooth(method = lm) +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "βT (Δ°C/second)", x = "Reflectivity (%)",
+       colour = "Sex") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+# treatment = uvvis
+ggplot(data = reference, aes(y=uvvis_slope, x=vis_wrfl_area)) +
+  geom_smooth(method = lm) +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "βT (Δ°C/second)", x = "Reflectivity (%)",
+       colour = "Sex") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+```
+
+## Body size and reflectivity
+
+We examined the relationship between bug reflectivity (mean reflectivity of each colour patch weighted by the proportion of that colour) and body size, our two predictor variables.
+
+### Model summaries
+
+Check the relationship between our two predictor variables: reflectivity and body size (measured as the area in mm2 of the dorsal surface) and check the correlation coefficient. Note that body size was square root transformed.
+
+```{r}
+# correlation plot
+# subset all the columns you need
+corr_plot <-  subset(reference, select = c(
+                        "full_wrfl",
+                        "nir_wrfl",
+                        "vis_wrfl",
+                        "area_mm2"
+                        )
+                    ) %>% na.omit() # remove NA values
+M = cor(corr_plot, method = "spearman")
+corrplot(M, method = 'number') # colourful numbers
+
+```
+
+### Visualise
+```{r}
+# linear relationship between body size and colour (Figure 4a)
+lm(data = reference, full_wrfl ~ sqrt(area_mm2)) %>% summary() # summary of model
+# lm(data = reference, full_wrfl ~ sqrt(area_mm2)) %>% plot() # diagnostic plot
+ggplot(data = reference, aes(x=sqrt(area_mm2), y=full_wrfl)) +
+  geom_smooth(method = lm, color = "black") +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "Reflectivity (%)", x = "Body size (mm²)") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+# male vs female size
+ggplot(data = reference, aes(x=sex, y=area_mm2)) +
+  geom_boxplot() +
+  # geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "Body size (mm²)", x = "Sex") +
+  # scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  # scale_colour_manual(values = c("male" = "#7570b3", "female" = "#1b9e77")) +
+  theme_bw()
+
+# male vs female reflectivity
+ggplot(data = reference, aes(x=sex, y=full_wrfl*100)) +
+  geom_boxplot() +
+  # geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "Reflectivity (%)", x = "Sex") +
+  # scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  # scale_colour_manual(values = c("male" = "#7570b3", "female" = "#1b9e77")) +
+  theme_bw()
+
+```
+
+Check the variation in reflectivity between sexes, morphs, and in different wavelengths.
+
+```{r}
+wrfl_variation <- reference %>%  select(code, sex, proportion_iridescent, full_wrfl, nir_wrfl, vis_wrfl, imgpath)
+wrfl_variation <- wrfl_variation %>%
+  mutate(morph = ifelse(sex == "male" & proportion_iridescent <= .50, "male (red-orange morph)",
+                        ifelse(sex == "male" & proportion_iridescent > .50, "male (blue morph)", 
+                               ifelse(sex == "female", "female", NA))))
+wrfl_variation <- wrfl_variation %>%  pivot_longer(cols = c(full_wrfl, nir_wrfl, vis_wrfl),
+                                        names_to = "spectra", names_pattern = "(.*)_wrfl",
+                                        values_to = "wrfl")
+wrfl_variation$morph <- factor(wrfl_variation$morph, levels = c("female", "male (red-orange morph)", "male (blue morph)"))  # Specify the desired order
+wrfl_variation$spectra <- factor(wrfl_variation$spectra, levels = c("vis", "nir", "full"))  # Specify the desired order
+
+# plot
+ggplot(data = wrfl_variation, aes(x=spectra, y=wrfl*100)) +
+  geom_boxplot() +
+  geom_point(aes(color = morph), alpha = .70, size = 3,
+             position = position_jitter(seed = 23)) +
+  # geom_image(aes(image=imgpath), size = .07) +
+  scale_x_discrete(labels = c("full" = "full", "nir" = "near-infrared", "vis" = "visible")) +
+  labs(y = "Reflectivity (%)", x = "Wavelength range", colour = "Sex") +
+  scale_colour_manual(values = c("male (blue morph)" = "#2A788EFF", "male (red-orange morph)" = "#440154FF", "female" = "#3dc18c")) +
+  theme_bw()
+
+```
+
+## Size-independent reflectivity and heating
+
+We can run a regression model to address the collinearity between predictors by using the residuals of one predictor regressed on the other. To to this we can:
+1. Fit a regression model with one predictor (e.g., color) regressed on the other (e.g., size).
+2. Extract the residuals from this regression.
+3. Use these residuals as the new predictor in your final regression model with the response variable (heating rate).
+
+Calculate colour residuals.
+
+```{r}
+# add residuals to reference data frame
+reference$full_color_residuals <- lm(data = reference, full_wrfl ~ sqrt(area_mm2)) %>% residuals()
+reference$nir_color_residuals <- lm(data = reference, nir_wrfl ~ sqrt(area_mm2)) %>% residuals()
+reference$vis_color_residuals <- lm(data = reference, vis_wrfl ~ sqrt(area_mm2)) %>% residuals()
+
+# check to see that residuals are now independent of body size
+ggplot(data = reference, aes(y=full_color_residuals, x=sqrt(area_mm2))) +
+  geom_smooth(method = lm) +
+  geom_point(aes(color = sex)) +
+  labs(x = "Reflectivity (controlled by size)", y = "Square root(Body size in mm²)",
+       color = "Sex") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+```
+### Model summaries
+
+Results of the linear models.
+
+```{r}
+# create the models
+models <- list(
+  "full" = lm(data = reference, full_delta ~ full_color_residuals + sqrt(area_mm2)),
+  "NIR" = lm(data = reference, nir_delta ~ nir_color_residuals + sqrt(area_mm2)),
+  "UV-VIS" = lm(data = reference, uvvis_delta ~ vis_color_residuals  + sqrt(area_mm2)),
+  "full" = lm(data = reference, full_slope ~ full_color_residuals + sqrt(area_mm2)),
+  "NIR" = lm(data = reference, nir_slope ~ nir_color_residuals + sqrt(area_mm2)),
+  "UV-VIS" = lm(data = reference, uvvis_slope ~ vis_color_residuals  + sqrt(area_mm2))
+)
+
+modelsummary(models, stars = TRUE,
+             estimate = "{estimate}",
+             statistic = c("{std.error}",
+                           "{statistic}",
+                           "{p.value}"),
+             output = "tinytable") %>% 
+  group_tt(j = list("Delta (ΔT)" = 2:4, "Slope (βT)" = 5:7)) #%>%  save_tt("modeltable_UPDATED.docx")
+
+```
+
+### Visualise
+
+#### Models with ΔT (final temperature after 5 minutes) as response variable.
+
+```{r}
+# treatment = full
+ggplot(data = reference, aes(y=full_delta, x=full_color_residuals)) +
+  geom_smooth(method = lm, color = "black") +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "ΔT (°C)", x = "more iridescent          Reflectivity (controlled by size)          less iridescent") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+# treatment = nir
+ggplot(data = reference, aes(y=nir_delta, x=nir_color_residuals)) +
+  geom_smooth(method = lm, color = "black") +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "ΔT (°C)", x = "more iridescent          Reflectivity (controlled by size)          less iridescent") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+# treatment = uvvis
+ggplot(data = reference, aes(y=uvvis_delta, x=vis_color_residuals)) +
+  geom_smooth(method = lm, color = "black") +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "ΔT (°C)", x = "more iridescent          Reflectivity (controlled by size)          less iridescent") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+```
+
+#### Models with βT (heating rate) as response variable.
+```{r}
+# treatment = full
+ggplot(data = reference, aes(y=full_slope, x=full_color_residuals)) +
+  geom_smooth(method = lm, color = "black") +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "βT (Δ°C/second)", x = "more iridescent          Reflectivity (controlled by size)          less iridescent") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+# treatment = nir
+ggplot(data = reference, aes(y=nir_slope, x=nir_color_residuals)) +
+  geom_smooth(method = lm, color = "black") +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "βT (Δ°C/second)", x = "more iridescent          Reflectivity (controlled by size)          less iridescent") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+# treatment = uvvis
+ggplot(data = reference, aes(y=uvvis_slope, x=vis_color_residuals)) +
+  geom_smooth(method = lm, color = "black") +
+  geom_point(aes(color = sex), alpha = .25, size = 7) +
+  geom_image(aes(image=imgpath), size = .07) +
+  labs(y = "βT (Δ°C/second)", x = "more iridescent          Reflectivity (controlled by size)          less iridescent") +
+  scale_colour_manual(values = c("male" = "#571267", "female" = "#3dc18c")) +
+  theme_bw()
+
+```
+
+## Separate models
+
+### Body size only
+
+```{r}
+
+models_size <- list(
+  "full" = lm(data = reference, full_delta ~ sqrt(area_mm2)),
+  "NIR" = lm(data = reference, nir_delta ~ sqrt(area_mm2)),
+  "UV-VIS" = lm(data = reference, uvvis_delta ~ sqrt(area_mm2)),
+  "full" = lm(data = reference, full_slope ~ sqrt(area_mm2)),
+  "NIR" = lm(data = reference, nir_slope ~  sqrt(area_mm2)),
+  "UV-VIS" = lm(data = reference, uvvis_slope ~ sqrt(area_mm2))
+)
+
+modelsummary(models_size, stars = TRUE,
+             estimate = "{estimate}",
+             statistic = c("{std.error}",
+                           "{statistic}",
+                           "{p.value}"),
+             output = "tinytable") %>% 
+  group_tt(j = list("Delta (ΔT)" = 2:4, "Slope (βT)" = 5:7)) 
+
+```
+
+### Residuals only
+
+```{r}
+# ONLY RESIDUALS
+models_residuals <- list(
+  "full" = lm(data = reference, full_delta ~ full_color_residuals),
+  "NIR" = lm(data = reference, nir_delta ~ nir_color_residuals),
+  "UV-VIS" = lm(data = reference, uvvis_delta ~ vis_color_residuals),
+  "full" = lm(data = reference, full_slope ~ full_color_residuals),
+  "NIR" = lm(data = reference, nir_slope ~ nir_color_residuals),
+  "UV-VIS" = lm(data = reference, uvvis_slope ~ vis_color_residuals)
+)
+
+modelsummary(models_residuals, stars = TRUE,
+             estimate = "{estimate}",
+             statistic = c("{std.error}",
+                           "{statistic}",
+                           "{p.value}"),
+             output = "tinytable")
+
+```
+
