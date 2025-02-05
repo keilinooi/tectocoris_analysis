@@ -912,7 +912,6 @@ ggplot(data = reference, aes(y=uvvis_slope, x=vis_color_residuals)) +
 ### Body size only
 
 ```{r}
-
 models_size <- list(
   "full" = lm(data = reference, full_delta ~ sqrt(area_mm2)),
   "NIR" = lm(data = reference, nir_delta ~ sqrt(area_mm2)),
@@ -935,7 +934,6 @@ modelsummary(models_size, stars = TRUE,
 ### Residuals only
 
 ```{r}
-# ONLY RESIDUALS
 models_residuals <- list(
   "full" = lm(data = reference, full_delta ~ full_color_residuals),
   "NIR" = lm(data = reference, nir_delta ~ nir_color_residuals),
